@@ -1,391 +1,105 @@
-# Vertex Animation Texture (VAT) Blender Plugin
+# Vertex Animation Texture (VAT) Exporter for Blender
 
-A Blender addon for exporting animated mesh data as textures for use in game engines (Unity, Unreal, Godot) and real-time applications.
+Bake any mesh animation (armatures, shape keys, modifiers, cloth, object motion) into
+textures, and play it back in a game engine with a cheap vertex shader. Unreal Engine 5
+is the first supported target.
 
-## Features
+## What it exports
 
-- Export vertex positions as 32-bit EXR textures
-- Export vertex normals as separate textures
-- Automatic texture size calculation
-- Bounding box normalization
-- Frame range selection
-- Metadata JSON export for shader setup
-- Support for modifiers and deformations
-- Coordinate system conversion (Z-up to Y-up)
-- Progress bar for long exports
-- Power of 2 texture dimensions option
+For an object named in **Name** (default `VAT`):
 
-## Installation
+| File | Contents |
+|---|---|
+| `VAT_offset.exr` | 32-bit float RGB: per-vertex **offset from the rest pose**, per frame, already in the target engine's axes and units |
+| `VAT_normal.exr` | 32-bit float RGB: per-vertex normal (−1..1, not remapped), per frame |
+| `VAT_mesh.fbx` | The rest mesh (first baked frame) with an extra UV map, `VAT_Lookup` |
+| `VAT_metadata.json` | Frame count, fps, texture size, `frame_v_stride`, offset bounds |
 
-1. Download `vertex_animation_texture.py`
-2. Open Blender
-3. Go to Edit > Preferences > Add-ons
-4. Click "Install" and select the `.py` file
-5. Enable "Animation: Vertex Animation Texture Exporter"
+**Why a mesh and a lookup UV?** Engines split and reorder vertices on import (at UV seams
+and hard edges), so a shader can't use the vertex ID to find its texel. `VAT_Lookup`
+stores each vertex's texel coordinates, and it survives import.
 
-## Usage
+### Texture layout
 
-### 1. Prepare Your Mesh
+- Each frame is a block of `rows_per_frame` rows. Vertices fill a row left to right and
+  wrap onto the next row past **Max Width**, so any vertex count works.
+- Frame 0 is the **top** block of the image. Frame `f` is `f * frame_v_stride` further down in V.
+- Frame 0 is the rest pose, so its offsets are all zero.
+- With **Power of 2 Height**, padding rows are added at the bottom.
 
-- Select the animated mesh object
-- Ensure your animation is complete (keyframes, modifiers, etc.)
-- The mesh vertex count must remain constant across all frames
+## Install
 
-### 2. Configure Export Settings
+Blender 3.6 or newer. Go to *Edit › Preferences › Add-ons › Install from Disk*, pick
+`vertex_animation_texture.py`, then enable it. The panel is under *3D View › Sidebar (N) › VAT*.
 
-Find the VAT panel in the 3D View sidebar (press `N` key, look for "VAT" tab):
+## Use
 
-- **Export Path**: Directory where textures will be saved
-- **Texture Name**: Base name for output files (e.g., "character")
-- **Start Frame / End Frame**: Animation range to bake
-- **Texture Width**: Automatically calculated or manually set
-- **Export Normals**: Include normal data texture
-- **Normalize to Bounds**: Map positions to 0-1 range
-- **Flip Y/Z**: Convert from Blender's Z-up to Unity/Unreal's Y-up
-- **Power of 2 Height**: Round texture height to power of 2 for older GPU compatibility
+1. Select the animated mesh and set **Target** to *Unreal Engine*.
+2. Set the frame range, or click **Use Scene Range**.
+3. Click **Export VAT**.
 
-### 3. Calculate Texture Size
+The vertex count must stay the same on every frame. Remesh, Decimate, liquid sims and a
+subdivision level that changes over time will all fail with a clear error.
 
-Click "Calculate Texture Size" to automatically determine optimal dimensions:
-- **Width** = Vertex count (rounded to power of 2)
-- **Height** = Frame count (optionally rounded to power of 2)
+## Unreal Engine 5 setup
 
-### 4. Export
+> ⚠️ This setup has not been verified in Unreal yet. The Blender side has automated tests;
+> the Unreal side needs a real test, so report what breaks.
 
-Click "Export VAT" to generate:
-- `{name}_position.exr` - Vertex positions (RGB = XYZ)
-- `{name}_normal.exr` - Vertex normals (RGB = normalized XYZ)
-- `{name}_metadata.json` - Animation data for shader setup
+### 1. Import the mesh (`VAT_mesh.fbx`)
+- Uniform scale **1.0**. Keep normals as imported.
+- In the Static Mesh editor, under *LOD0 › Build Settings*, enable **Use Full Precision UVs**.
+  Without it, UVs are stored as half floats and land on the wrong texel on wide textures.
+- `VAT_Lookup` is the **last** UV channel. If the mesh had one UV map, it's **UV 1**.
+- In *Details › Bounds*, raise **Positive/Negative Bounds Extension** by the
+  `offset_max` / `offset_min` values from the metadata, or the mesh will be culled while it moves.
 
-## Output Files
+### 2. Import the textures (`VAT_offset.exr`, `VAT_normal.exr`)
+- **sRGB**: off.
+- **Compression**: *HDR High Precision (RGBA 32F)* if your version has it, otherwise *HDR (RGBA 16F)*.
+  16F is fine for small motion but jitters when offsets are large.
+- **Filter**: Nearest. **Mip Gen Settings**: NoMipmaps. **Never Stream**: on.
 
-### Position Texture
-- Format: 32-bit EXR (float precision)
-- Width: Vertex count
-- Height: Frame count
-- Data: RGB = XYZ position (normalized to 0-1 if enabled)
-- Color Space: Non-Color (linear data)
-
-### Normal Texture
-- Format: 32-bit EXR
-- Data: RGB = Normal vector (converted from -1,1 to 0,1 range)
-- Color Space: Non-Color (linear data)
-
-### Metadata JSON
-```json
-{
-  "vertex_count": 1024,
-  "frame_count": 100,
-  "start_frame": 1,
-  "end_frame": 100,
-  "fps": 24,
-  "texture_width": 1024,
-  "texture_height": 100,
-  "padded_height": false,
-  "bounds_min": [-1.5, 0.0, -1.0],
-  "bounds_max": [1.5, 2.0, 1.0],
-  "normalize_bounds": true,
-  "has_normals": true,
-  "coordinate_system": "z_up",
-  "object_name": "MyMesh"
-}
-```
-
-## Shader Implementation
-
-**IMPORTANT**: The texture stores frame 0 at V=0 (bottom of texture) and the last frame at V=1 (top of texture). The shader examples below account for this.
-
-### Unity HLSL Shader Example
+### 3. Material
+Add a **Custom** node, set its output type to *CMOT Float 3*, and give it these inputs:
+`Tex` (connect a *Texture Object* of `VAT_offset`), `UV` (TexCoord with the lookup
+channel index), `Frame`, `FrameCount` and `Stride` (`frame_v_stride` from the metadata).
 
 ```hlsl
-Shader "Custom/VertexAnimationTexture"
-{
-    Properties
-    {
-        _MainTex ("Texture", 2D) = "white" {}
-        _PositionTex ("Position Texture", 2D) = "white" {}
-        _NormalTex ("Normal Texture", 2D) = "white" {}
-        _AnimationTime ("Animation Time (0-1)", Float) = 0
-        _BoundsMin ("Bounds Min", Vector) = (0,0,0,0)
-        _BoundsMax ("Bounds Max", Vector) = (1,1,1,0)
-        _FrameCount ("Frame Count", Float) = 100
-    }
-    
-    SubShader
-    {
-        Tags { "RenderType"="Opaque" }
-        
-        Pass
-        {
-            CGPROGRAM
-            #pragma vertex vert
-            #pragma fragment frag
-            #include "UnityCG.cginc"
-            
-            struct appdata
-            {
-                float2 uv : TEXCOORD0;
-                uint vertexID : SV_VertexID;
-            };
-            
-            struct v2f
-            {
-                float2 uv : TEXCOORD0;
-                float4 vertex : SV_POSITION;
-                float3 normal : NORMAL;
-            };
-            
-            sampler2D _MainTex;
-            sampler2D _PositionTex;
-            sampler2D _NormalTex;
-            float _AnimationTime;
-            float3 _BoundsMin;
-            float3 _BoundsMax;
-            float _FrameCount;
-            
-            float4 _PositionTex_TexelSize; // Auto-provided by Unity (x=1/w, y=1/h, z=w, w=h)
-            
-            v2f vert (appdata v)
-            {
-                v2f o;
-                
-                float vertexCount = _PositionTex_TexelSize.z; // Width
-                float textureHeight = _PositionTex_TexelSize.w; // Height
-                
-                // Calculate frame indices for interpolation
-                float animProgress = frac(_AnimationTime); // 0 to 1
-                float frameFloat = animProgress * (_FrameCount - 1); // 0 to frameCount-1
-                float frame = floor(frameFloat);
-                float nextFrame = min(frame + 1, _FrameCount - 1);
-                float blend = frac(frameFloat);
-                
-                // UV coordinates
-                // U: vertex index (0.5 offset for pixel center)
-                float u = (v.vertexID + 0.5) / vertexCount;
-                
-                // V: frame index - frame 0 is at V=0 (bottom), last frame at V=1 (top)
-                // Add 0.5 offset for pixel center sampling
-                float v1 = (frame + 0.5) / textureHeight;
-                float v2 = (nextFrame + 0.5) / textureHeight;
-                
-                // Sample position textures
-                float3 pos1 = tex2Dlod(_PositionTex, float4(u, v1, 0, 0)).rgb;
-                float3 pos2 = tex2Dlod(_PositionTex, float4(u, v2, 0, 0)).rgb;
-                
-                // Interpolate between frames
-                float3 position = lerp(pos1, pos2, blend);
-                
-                // Denormalize position (0-1 back to world space)
-                position = position * (_BoundsMax - _BoundsMin) + _BoundsMin;
-                
-                // Sample normals
-                float3 normal1 = tex2Dlod(_NormalTex, float4(u, v1, 0, 0)).rgb;
-                float3 normal2 = tex2Dlod(_NormalTex, float4(u, v2, 0, 0)).rgb;
-                float3 normal = lerp(normal1, normal2, blend);
-                
-                // Denormalize normal (0-1 back to -1,1)
-                normal = normal * 2.0 - 1.0;
-                
-                o.vertex = UnityObjectToClipPos(float4(position, 1.0));
-                o.normal = UnityObjectToWorldNormal(normal);
-                o.uv = v.uv;
-                
-                return o;
-            }
-            
-            fixed4 frag (v2f i) : SV_Target
-            {
-                // Simple lighting
-                float3 lightDir = normalize(float3(0.5, 1, 0.5));
-                float NdotL = max(0, dot(i.normal, lightDir));
-                
-                fixed4 col = tex2D(_MainTex, i.uv);
-                col.rgb *= NdotL * 0.8 + 0.2; // Add ambient
-                
-                return col;
-            }
-            ENDCG
-        }
-    }
-}
+float f0 = floor(Frame);
+float f1 = fmod(f0 + 1.0, FrameCount);   // loop back to the start
+float t  = Frame - f0;
+float3 a = Texture2DSampleLevel(Tex, TexSampler, UV + float2(0, f0 * Stride), 0).rgb;
+float3 b = Texture2DSampleLevel(Tex, TexSampler, UV + float2(0, f1 * Stride), 0).rgb;
+return lerp(a, b, t);
 ```
 
-### Unreal Engine Material Setup
+- **Frame** for a looping clip: `frac(Time * FPS / FrameCount) * FrameCount`, with `FPS` and
+  `FrameCount` from the metadata.
+- Custom node output → **TransformVector (Local → World)** → **World Position Offset**.
+- Normals (optional): run the same Custom node on `VAT_normal`, then *TransformVector
+  (Local → World)*, then *Normal*. Untick **Tangent Space Normal** on the material.
+- For static, non-looping clips, drop the `fmod` and clamp `Frame` instead.
 
-1. **Create Material**
-   - Add two Texture Sample nodes (Position and Normal textures)
-   - Set texture compression to HDR or Vector Displacement
-   - Set sampler to Linear Color (no sRGB)
+## Tests
 
-2. **Vertex Shader Setup**
-   ```
-   // U coordinate: vertex ID normalized to texture width
-   VertexID → Divide by VertexCount → U coordinate
-   
-   // V coordinate: frame 0 at V=0, last frame at V≈1
-   Time → Multiply by FPS → Modulo by FrameCount → Divide by TextureHeight → V coordinate
-   
-   // Sample and denormalize
-   Sample Position Texture at (U, V)
-   Denormalize: Position * (BoundsMax - BoundsMin) + BoundsMin
-   
-   Connect to World Position Offset
-   ```
+The tests run headless, outside Blender, using the `bpy` wheel:
 
-3. **Normal Setup**
-   ```
-   Sample Normal Texture at (U, V)
-   Denormalize: Normal * 2 - 1
-   
-   Connect to Normal input (World Space)
-   ```
-
-### Godot Shader Example
-
-```gdshader
-shader_type spatial;
-
-uniform sampler2D position_texture : hint_default_white, filter_linear, repeat_disable;
-uniform sampler2D normal_texture : hint_default_white, filter_linear, repeat_disable;
-uniform float animation_time : hint_range(0.0, 1.0) = 0.0;
-uniform vec3 bounds_min = vec3(0.0);
-uniform vec3 bounds_max = vec3(1.0);
-uniform float frame_count = 100.0;
-
-void vertex() {
-    // Calculate texture coordinates
-    float vertex_count = float(textureSize(position_texture, 0).x);
-    float texture_height = float(textureSize(position_texture, 0).y);
-    
-    // U: vertex index
-    float u = (float(VERTEX_ID) + 0.5) / vertex_count;
-    
-    // V: frame index - frame 0 at V=0, last frame at V≈1
-    float frame_float = fract(animation_time) * (frame_count - 1.0);
-    float frame = floor(frame_float);
-    float next_frame = min(frame + 1.0, frame_count - 1.0);
-    float blend = fract(frame_float);
-    
-    float v1 = (frame + 0.5) / texture_height;
-    float v2 = (next_frame + 0.5) / texture_height;
-    
-    // Sample positions with interpolation
-    vec3 pos1 = texture(position_texture, vec2(u, v1)).rgb;
-    vec3 pos2 = texture(position_texture, vec2(u, v2)).rgb;
-    vec3 position = mix(pos1, pos2, blend);
-    
-    // Denormalize position
-    position = position * (bounds_max - bounds_min) + bounds_min;
-    
-    // Sample and interpolate normals
-    vec3 normal1 = texture(normal_texture, vec2(u, v1)).rgb;
-    vec3 normal2 = texture(normal_texture, vec2(u, v2)).rgb;
-    vec3 normal = mix(normal1, normal2, blend);
-    
-    // Denormalize normal (0-1 to -1,1)
-    normal = normal * 2.0 - 1.0;
-    
-    VERTEX = position;
-    NORMAL = normalize(normal);
-}
-
-void fragment() {
-    ALBEDO = vec3(1.0);
-}
+```sh
+python -m venv .venv && .venv/bin/pip install bpy pytest OpenEXR
+.venv/bin/python -m pytest tests
 ```
 
-## Tips & Best Practices
+They bake a deforming, moving mesh, read the EXR back with OpenEXR, re-import the FBX,
+sample every vertex through `VAT_Lookup` the way Unreal does, and compare against offsets
+computed independently with `mathutils`.
 
-1. **Vertex Count**: Keep vertex count as low as possible while maintaining detail
-2. **Texture Size**: Use power-of-2 dimensions when possible for better GPU performance
-3. **Frame Rate**: Consider reducing frame count by sampling every N frames
-4. **Precision**: Use EXR format for maximum precision, or convert to PNG for smaller file size
-5. **Compression**: Game engines may apply compression - test with your target platform
-6. **Multiple Meshes**: Export each mesh separately if they have different vertex counts
-7. **Coordinate System**: Enable "Flip Y/Z" when exporting to Unity or Unreal Engine
-
-## Troubleshooting
-
-### Mesh appears distorted
-- Check that "Normalize to Bounds" is enabled
-- Verify bounds_min/max in metadata matches shader constants
-- Ensure textures are imported with linear color space (no sRGB/gamma)
-
-### Animation doesn't loop
-- Ensure start and end frames create a seamless loop
-- Check frame count calculation in shader
-- Verify `_FrameCount` uniform matches metadata
-
-### Performance issues
-- Reduce texture resolution if possible
-- Consider using lower precision formats (16-bit float)
-- Cache texture lookups when possible
-
-### Mesh appears inside-out or wrong orientation
-- Enable "Flip Y/Z" option if exporting to Y-up engines (Unity, Unreal)
-- Check the `coordinate_system` field in metadata
-
-### Vertex count mismatch error
-- This means a modifier is changing the mesh topology during animation
-- Check for Subdivision Surface, Decimate, Remesh, or similar modifiers
-- Apply modifiers that should be constant, or disable topology-changing ones
-
-## Technical Details
-
-### How It Works
-
-1. For each frame in the animation:
-   - Evaluate all modifiers and deformations
-   - Extract vertex positions in world space
-   - Transform using proper 4x4 matrix (handles position, rotation, scale)
-   - Store positions as RGB values in texture row
-
-2. Texture Layout:
-   - X-axis: Vertices (one column per vertex)
-   - Y-axis: Time/Frames (row 0 = frame 0 at bottom, row N = last frame at top)
-   - RGB: XYZ position or normal data
-
-3. Shader Reconstruction:
-   - Use vertex ID to find column (U coordinate)
-   - Use animation time to find row (V coordinate)
-   - Sample texture to get position
-   - Denormalize from 0-1 back to world space
-
-### Normal Transformation
-
-Normals are transformed using the inverse-transpose of the 3x3 rotation/scale matrix. This ensures correct normal orientation even with non-uniform scaling.
-
-## Changelog
-
-### v1.0.3
-- Fixed world matrix transformation for scaled/rotated objects
-- Fixed EXR color space (now correctly set to Non-Color)
-- Fixed shader V coordinate documentation
-- Added progress bar for long exports
-- Added animation detection warning
-- Added power of 2 height option
-- Improved panel performance (cached vertex count)
-- Added "Refresh Vertex Count" button
-- Removed unnecessary image packing
-- Better error messages
-
-### v1.0.2
-- Added coordinate system conversion (Y/Z flip)
-- Added vertex count consistency check
-- Faster vertex extraction using foreach_get
-- Fixed image pixel flipping
-- Added texture width validation
-
-### v1.0.1
-- Fixed image pixel storage order
-- Fixed normal matrix scaling
-- Added frame range validation
-
-### v1.0.0
-- Initial release
+## Known limitations
+- Normals are smooth per-vertex normals, so hard edges are softened during animation.
+- Only one object per export. Join meshes first.
+- Unity and Godot presets aren't there yet. *Raw Blender* exports Blender object-space
+  metres for custom pipelines.
 
 ## License
 
-MIT License - Free to use in commercial and personal projects
-
-## Credits
+GPL-3.0-or-later. See [LICENSE](LICENSE).
